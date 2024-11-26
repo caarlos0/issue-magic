@@ -13,14 +13,17 @@ use std::{
     io::{self, Read, Write},
 };
 
+/// A CLI tool that uses Claude AI to automatically label GitHub issues based on their content
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "config.toml")]
+    /// Path to the configuration file containing repository and labeling rules
+    #[arg(short, long, default_value = "config.toml")]
     config: String,
 
-    #[arg(short, long, default_value = "true")]
-    confirm: bool,
+    /// Automatically apply labels without asking for confirmation
+    #[arg(short, long, default_value = "false")]
+    auto: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,7 +197,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if !args.confirm || user_confirm(&labels)? {
+        if args.auto || user_confirm(&labels)? {
             label_issue(
                 &octocrab,
                 &config.repository.owner,
