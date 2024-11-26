@@ -10,14 +10,17 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
 };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(long, default_value = "config.toml")]
     config: String,
+
+    #[arg(short, long, default_value = "true")]
+    confirm: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +49,7 @@ async fn list_issues(
         .issues(owner, repo)
         .list()
         .labels(&[]) // Only get issues without labels
+        .per_page(100)
         .send()
         .await?;
 
@@ -60,8 +64,14 @@ fn build_prompt(issue: &octocrab::models::issues::Issue, config: &Config) -> Str
     let mut prompt = String::new();
 
     // Add issue information
-    prompt.push_str("Based on the following issue, respond ONLY with a comma-separated list of labels that should be applied. If no labels apply, respond with 'none'.\n");
-    prompt.push_str("If none of the label rules apply, respond with 'non'.\n\n");
+    let instructions = vec![
+		"Based on the following issue, respond ONLY with a comma-separated list of labels that should be applied.\n",
+		"If no labels apply, respond with 'none'.\n",
+		"If none of the label rules apply, respond with 'none'.\n",
+		"Do not suggest labels other than the ones provided below.\n",
+		"\n\n",
+	];
+    instructions.iter().for_each(|s| prompt.push_str(s));
     prompt.push_str(&format!("Issue Title: {}\n", issue.title));
     prompt.push_str(&format!(
         "Issue Body: {}\n\n",
@@ -115,17 +125,19 @@ async fn ask_claude(client: &Client, prompt: &str) -> Result<Vec<String>> {
     Ok(labels)
 }
 
-fn get_user_confirmation(issue_title: &str, labels: &[String]) -> Result<bool> {
-    print!(
-        "\nReady to apply the following labels to issue \"{}\": {:?}\nProceed? [y/N] ",
-        issue_title, labels
-    );
+fn user_confirm(labels: &[String]) -> Result<bool> {
+    print!("Apply \x1b[3m{:?}\x1b[0m? [y/N] ", labels);
     io::stdout().flush()?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let mut buffer = [0; 1];
 
-    Ok(input.trim().to_lowercase() == "y")
+    stdin.read_exact(&mut buffer)?;
+    let input = buffer[0] as char;
+    println!(); // print newline after input
+
+    Ok(input == 'y' || input == 'Y')
 }
 
 async fn label_issue(
@@ -158,10 +170,21 @@ async fn main() -> Result<()> {
 
     let issues = list_issues(&octocrab, &config.repository.owner, &config.repository.name).await?;
 
-    println!("Found {} unlabeled issues", issues.len());
+    println!("Found \x1b[1m{}\x1b[0m unlabeled issues", issues.len());
 
     for issue in issues {
-        println!("Processing issue #{} {}", issue.number, issue.title);
+        println!("\n\x1b[1m#{}: {}\x1b[0m", issue.number, issue.title);
+        println!(
+            "\x1b[2m{}\x1b[0m",
+            issue
+                .body
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .map(|line| format!("  {}", line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
 
         let prompt = build_prompt(&issue, &config);
         let labels = ask_claude(&claude, &prompt).await?;
@@ -171,7 +194,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if get_user_confirmation(&issue.title, &labels)? {
+        if !args.confirm || user_confirm(&labels)? {
             label_issue(
                 &octocrab,
                 &config.repository.owner,
