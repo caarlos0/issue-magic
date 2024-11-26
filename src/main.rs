@@ -7,7 +7,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use octocrab::Octocrab;
 use serde::Deserialize;
-use std::{collections::HashMap, env, fs};
+use std::{
+    collections::HashMap,
+    env, fs,
+    io::{self, Write},
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -76,10 +80,7 @@ fn build_prompt(issue: &octocrab::models::issues::Issue, config: &Config) -> Str
     prompt
 }
 
-async fn ask_claude(prompt: &str) -> Result<Vec<String>> {
-    let cfg = AnthropicConfig::new()?;
-    let client = Client::try_from(cfg)?;
-
+async fn ask_claude(client: &Client, prompt: &str) -> Result<Vec<String>> {
     let messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
@@ -114,6 +115,19 @@ async fn ask_claude(prompt: &str) -> Result<Vec<String>> {
     Ok(labels)
 }
 
+fn get_user_confirmation(issue_title: &str, labels: &[String]) -> Result<bool> {
+    print!(
+        "\nReady to apply the following labels to issue \"{}\": {:?}\nProceed? [y/N] ",
+        issue_title, labels
+    );
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    Ok(input.trim().to_lowercase() == "y")
+}
+
 async fn label_issue(
     client: &Octocrab,
     owner: &str,
@@ -121,12 +135,10 @@ async fn label_issue(
     issue_number: u64,
     labels: Vec<String>,
 ) -> Result<()> {
-    if !labels.is_empty() {
-        client
-            .issues(owner, repo)
-            .add_labels(issue_number, labels.as_slice())
-            .await?;
-    }
+    client
+        .issues(owner, repo)
+        .add_labels(issue_number, labels.as_slice())
+        .await?;
     Ok(())
 }
 
@@ -141,6 +153,9 @@ async fn main() -> Result<()> {
         env::var("GITHUB_TOKEN").context("GITHUB_TOKEN environment variable not set")?;
     let octocrab = Octocrab::builder().personal_token(github_token).build()?;
 
+    let claude_cfg = AnthropicConfig::new()?;
+    let claude = Client::try_from(claude_cfg)?;
+
     let issues = list_issues(&octocrab, &config.repository.owner, &config.repository.name).await?;
 
     println!("Found {} unlabeled issues", issues.len());
@@ -149,9 +164,14 @@ async fn main() -> Result<()> {
         println!("Processing issue #{} {}", issue.number, issue.title);
 
         let prompt = build_prompt(&issue, &config);
-        let labels = ask_claude(&prompt).await?;
+        let labels = ask_claude(&claude, &prompt).await?;
 
-        if !labels.is_empty() {
+        if labels.is_empty() {
+            println!("No labels to add for issue #{}", issue.number);
+            continue;
+        }
+
+        if get_user_confirmation(&issue.title, &labels)? {
             label_issue(
                 &octocrab,
                 &config.repository.owner,
@@ -162,7 +182,7 @@ async fn main() -> Result<()> {
             .await?;
             println!("Added labels to issue #{}: {:?}", issue.number, labels);
         } else {
-            println!("No labels to add for issue #{}", issue.number);
+            println!("Skipped labeling issue #{}", issue.number);
         }
     }
 
